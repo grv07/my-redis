@@ -1,11 +1,21 @@
 use bytes::Bytes;
 use mini_redis::{Result, client::connect};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+
+type Responder<T> = oneshot::Sender<mini_redis::Result<T>>;
 
 #[derive(Debug)]
 enum Cmd {
-    Set { key: String, value: Bytes },
-    Get { key: String },
+    Set {
+        key: String,
+        value: Bytes,
+        resp: Responder<()>,
+    },
+
+    Get {
+        key: String,
+        resp: Responder<Option<Bytes>>,
+    },
 }
 
 #[tokio::main]
@@ -18,65 +28,55 @@ async fn main() -> Result<()> {
     let tx1 = tx.clone();
 
     let t1 = tokio::spawn(async move {
+        let (res_tx, res_rx) = oneshot::channel();
+
         tx1.send(Cmd::Set {
             key: "hello".to_string(),
             value: "world!".into(),
+            resp: res_tx,
         })
         .await
         .unwrap();
 
-        tx1.send(Cmd::Set {
-            key: "ping".to_string(),
-            value: "pong".into(),
-        })
-        .await
-        .unwrap();
+        println!("Send Set");
 
-        tx1.send(Cmd::Set {
-            key: "yin".to_string(),
-            value: "yan".into(),
-        })
-        .await
-        .unwrap();
+        let res = res_rx.await;
+        println!("Got: {:?}", res);
     });
 
     let t2 = tokio::spawn(async move {
+        let (res_tx, res_rx) = oneshot::channel();
+
         tx.send(Cmd::Get {
             key: "hello".to_string(),
+            resp: res_tx,
         })
         .await
         .unwrap();
 
-        tx.send(Cmd::Get {
-            key: "ping".to_string(),
-        })
-        .await
-        .unwrap();
-
-        tx.send(Cmd::Get {
-            key: "yin".to_string(),
-        })
-        .await
-        .unwrap();
+        println!("Send Get");
+        let res = res_rx.await;
+        println!("Got: {:?}", res);
     });
-
-    t1.await.unwrap();
-    t2.await.unwrap();
 
     let task_manager = tokio::spawn(async move {
         while let Some(cmd) = rx.recv().await {
             match cmd {
-                Cmd::Set { key, value } => client.set(&key, value).await.unwrap(),
-                Cmd::Get { key } => {
-                    if let Some(value) = client.get(&key).await.unwrap() {
-                        println!("Value: {value:?}");
-                    }
+                Cmd::Set { key, value, resp } => {
+                    let res = client.set(&key, value).await;
+                    resp.send(res).unwrap();
+                }
+                Cmd::Get { key, resp } => {
+                    let res = client.get(&key).await;
+                    resp.send(res).unwrap();
                 }
             }
         }
     });
 
     task_manager.await.unwrap();
+    t1.await.unwrap();
+    t2.await.unwrap();
 
     Ok(())
 }
